@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import threading
+import urllib.parse
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -96,12 +97,12 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 # ---------------------------------------------------------------------
-# Middleware: Path Normalization
+# Middleware: Path Normalization with URL Unquoting (handles %3A and trailing slashes)
 # ---------------------------------------------------------------------
 @app.middleware("http")
 async def normalize_path_middleware(request: Request, call_next):
     raw_path = request.url.path
-    path = raw_path
+    path = urllib.parse.unquote(raw_path)
     while "//" in path:
         path = path.replace("//", "/")
 
@@ -125,6 +126,12 @@ async def normalize_path_middleware(request: Request, call_next):
 
     response = await call_next(request)
     return response
+
+
+@app.get("/")
+@app.head("/")
+async def root_health():
+    return {"status": "ok", "service": "A2A Invoice Action Agent"}
 
 
 def get_task_lock(task_id: str) -> threading.Lock:
