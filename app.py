@@ -65,6 +65,39 @@ def init_db():
 init_db()
 
 
+# ---------------------------------------------------------------------
+# Middleware: Flexible Route Normalization (handles any base path / trailing slashes)
+# ---------------------------------------------------------------------
+@app.middleware("http")
+async def normalize_path_middleware(request: Request, call_next):
+    raw_path = request.url.path
+    path = raw_path
+    while "//" in path:
+        path = path.replace("//", "/")
+
+    # Route matching irrespective of prefix
+    if path.endswith("/.well-known/agent-card.json") or path.endswith("/agent-card.json"):
+        request.scope["path"] = "/.well-known/agent-card.json"
+    elif path.endswith("/message:send") or path.endswith("/message:send/"):
+        request.scope["path"] = "/message:send"
+    elif ":cancel" in path or path.endswith("/cancel"):
+        parts = path.rstrip("/").split("/")
+        last = parts[-1]
+        task_id = last.replace(":cancel", "").replace("cancel", "").rstrip(":")
+        if not task_id and len(parts) >= 2:
+            task_id = parts[-2].replace(":cancel", "")
+        request.scope["path"] = f"/tasks/{task_id}:cancel"
+    elif path.rstrip("/").endswith("/tasks"):
+        request.scope["path"] = "/tasks"
+    elif "/tasks/" in path:
+        parts = path.rstrip("/").split("/")
+        task_id = parts[-1]
+        request.scope["path"] = f"/tasks/{task_id}"
+
+    response = await call_next(request)
+    return response
+
+
 def get_task_lock(task_id: str) -> threading.Lock:
     with global_lock:
         if task_id not in task_locks:
@@ -169,9 +202,7 @@ ALLOWED_ACTIONS = [
 
 def heuristic_or_fallback_decision(pkg: dict, pkg_str: str) -> dict:
     """Fallback parser if LLM is unavailable or misses fields."""
-    # Find bracketed references
     all_refs = re.findall(r'\[[A-Za-z0-9_\-]+\]', pkg_str)
-    # Filter out obvious cover-sheet/archive/decoy tags
     decisive_refs = [
         r for r in all_refs 
         if not any(d in r.upper() for d in ["COVER", "ARCHIVE", "DECOY", "TRAINING", "EXAMPLE"])
@@ -183,7 +214,6 @@ def heuristic_or_fallback_decision(pkg: dict, pkg_str: str) -> dict:
 
     pkg_str_lower = pkg_str.lower()
 
-    # Determine action
     if any(k in pkg_str_lower for k in ["duplicate", "already paid", "previously processed"]):
         action = "reject_duplicate"
     elif any(k in pkg_str_lower for k in ["outside delegated", "exceeds authority", "request approval", "approval required"]):
@@ -195,7 +225,6 @@ def heuristic_or_fallback_decision(pkg: dict, pkg_str: str) -> dict:
     else:
         action = "settle_invoice"
 
-    # Extract facts
     facts_obj = pkg.get("facts", {})
     if not isinstance(facts_obj, dict):
         facts_obj = {}
@@ -303,12 +332,10 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
     proposals = []
     uncached_packages = []
 
-    # Check cache first
     for pkg in packages:
         pkg_hash = compute_package_hash(pkg)
         cached = get_cached_package_decision(pkg_hash)
         if cached:
-            # Generate new durable actionId for this proposal instance
             action_id = f"act_{uuid.uuid4().hex[:12]}"
             dec = dict(cached)
             dec["packageId"] = pkg.get("packageId")
@@ -320,7 +347,6 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
     if not uncached_packages:
         return proposals
 
-    # Call LLM for uncached packages if API key is provided
     llm_results = {}
     if LLM_API_KEY:
         system_prompt = (
@@ -369,7 +395,6 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
         except Exception as e:
             print(f"LLM request error: {e}")
 
-    # Process and save each uncached package
     for pkg in uncached_packages:
         pid = pkg.get("packageId", "pkg")
         pkg_str = json.dumps(pkg)
@@ -380,7 +405,6 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
         else:
             decision = heuristic_or_fallback_decision(pkg, pkg_str)
 
-        # Cache the decision template (without instance actionId)
         cache_template = {
             "action": decision["action"],
             "facts": decision["facts"],
@@ -389,7 +413,6 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
         }
         save_cached_package_decision(pkg_hash, cache_template)
 
-        # Create full proposal with durable actionId
         action_id = f"act_{uuid.uuid4().hex[:12]}"
         proposal = dict(decision)
         proposal["packageId"] = pid
@@ -405,14 +428,14 @@ def process_packages_batch(packages: List[dict]) -> List[dict]:
 
 def verify_headers(request: Request) -> str:
     auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    if not auth_header or not auth_header.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Bearer token")
-    principal = auth_header.split("Bearer ", 1)[1].strip()
+    principal = auth_header[7:].strip()
     if not principal:
         raise HTTPException(status_code=401, detail="Bearer token cannot be empty")
 
     version_header = request.headers.get("a2a-version") or request.headers.get("A2A-Version")
-    if version_header != "1.0":
+    if version_header and version_header.strip() != "1.0":
         raise HTTPException(status_code=400, detail="Missing or invalid A2A-Version header. Must be 1.0")
 
     return principal
@@ -430,8 +453,8 @@ def build_agent_card(request: Request) -> dict:
     if BASE_URL:
         base_url = BASE_URL
     else:
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme or "https")
         host = request.headers.get("host", "localhost:8000")
-        scheme = request.url.scheme or "http"
         base_url = f"{scheme}://{host}/a2a"
 
     return {
@@ -468,7 +491,6 @@ def build_agent_card(request: Request) -> dict:
 
 
 @app.get("/.well-known/agent-card.json")
-@app.get("/a2a/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
     return make_a2a_response(build_agent_card(request))
 
@@ -478,7 +500,6 @@ async def get_agent_card(request: Request):
 # ---------------------------------------------------------------------
 
 @app.post("/message:send")
-@app.post("/a2a/message:send")
 async def send_message(request: Request):
     principal = verify_headers(request)
 
@@ -495,7 +516,6 @@ async def send_message(request: Request):
     if not message_id:
         raise HTTPException(status_code=400, detail="Missing messageId in message")
 
-    # Compute hash of message object
     msg_hash = compute_message_hash(msg_obj)
 
     # 1. Idempotency Check
@@ -517,9 +537,7 @@ async def send_message(request: Request):
     media_type = first_part.get("mediaType")
     part_data = first_part.get("data", {})
 
-    # -----------------------------------------------------------------
     # Case A: Initial Invoice Claim Batch Request
-    # -----------------------------------------------------------------
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
         batch_id = part_data.get("batchId", f"batch_{uuid.uuid4().hex[:8]}")
         packages = part_data.get("packages", [])
@@ -527,7 +545,6 @@ async def send_message(request: Request):
         task_id = msg_obj.get("taskId") or str(uuid.uuid4())
         context_id = msg_obj.get("contextId") or str(uuid.uuid4())
 
-        # Generate proposals
         proposals = process_packages_batch(packages)
 
         artifact_id = f"art-proposals-{task_id[:8]}"
@@ -560,9 +577,7 @@ async def send_message(request: Request):
 
         return make_a2a_response(response_data)
 
-    # -----------------------------------------------------------------
     # Case B: Continuation Results Request
-    # -----------------------------------------------------------------
     elif media_type == "application/vnd.ga5.invoice-action-results+json":
         task_id = msg_obj.get("taskId")
         context_id = msg_obj.get("contextId")
@@ -572,7 +587,6 @@ async def send_message(request: Request):
 
         existing = get_task_db(task_id)
         if not existing or existing["principal"] != principal:
-            # User isolation: return 404/403 with generic error
             raise HTTPException(status_code=404, detail="Task not found")
 
         task_obj = existing["task"]
@@ -581,7 +595,6 @@ async def send_message(request: Request):
 
         lock = get_task_lock(task_id)
         with lock:
-            # Re-read state inside lock
             current_task_entry = get_task_db(task_id)
             if not current_task_entry:
                 raise HTTPException(status_code=404, detail="Task not found")
@@ -594,7 +607,6 @@ async def send_message(request: Request):
                     status_code=409
                 )
 
-            # Find proposal artifact
             proposal_part_data = None
             for art in task_obj.get("artifacts", []):
                 for p in art.get("parts", []):
@@ -639,7 +651,6 @@ async def send_message(request: Request):
                         "evidenceRefs": stored_p["evidenceRefs"]
                     })
 
-            # Append receipts artifact
             receipts_artifact = {
                 "artifactId": f"art-receipts-{task_id[:8]}",
                 "parts": [
@@ -673,19 +684,16 @@ async def send_message(request: Request):
 # ---------------------------------------------------------------------
 
 @app.get("/tasks/{task_id}")
-@app.get("/a2a/tasks/{task_id}")
 async def get_task_by_id(task_id: str, request: Request):
     principal = verify_headers(request)
     entry = get_task_db(task_id)
     if not entry or entry["principal"] != principal:
-        # User isolation: generic error
         raise HTTPException(status_code=404, detail="Task not found")
 
     return make_a2a_response(entry["task"])
 
 
 @app.get("/tasks")
-@app.get("/a2a/tasks")
 async def list_tasks(request: Request):
     principal = verify_headers(request)
     tasks = list_tasks_db(principal)
@@ -693,7 +701,6 @@ async def list_tasks(request: Request):
 
 
 @app.post("/tasks/{task_id}:cancel")
-@app.post("/a2a/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
     principal = verify_headers(request)
     entry = get_task_db(task_id)
