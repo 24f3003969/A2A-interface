@@ -2,11 +2,12 @@
 
 Exposes public HTTPS endpoints for propose and commit operations.
 Features:
-- Canonical hashing (inputDigest, callId, proposalDigest)
-- Durable SQLite storage (evaluations, dossiers cache, proposals)
+- Standard canonical SHA-256 digests (inputDigest, callId, proposalDigest)
+- Durable SQLite storage (evaluations, dossiers cache, proposals, logs)
 - Semantic threat detection & canary sanitization
 - Strict receipt verification & error handling (400, 409, 422)
 - Replay & conflict handling
+- Inspection endpoint for request diagnostics
 """
 
 import hashlib
@@ -72,24 +73,43 @@ def get_db():
                 proposal_json TEXT NOT NULL,
                 PRIMARY KEY (evaluation_id, dossier_id)
             );
+            CREATE TABLE IF NOT EXISTS mail_request_logs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp     REAL,
+                operation     TEXT,
+                eval_id       TEXT,
+                status_code   INTEGER,
+                req_summary   TEXT,
+                resp_summary  TEXT
+            );
             """
         )
         _conn.commit()
     return _conn
 
 
+def log_request(operation: str, eval_id: str, status_code: int, req_sum: str, resp_sum: str):
+    try:
+        with _db_lock:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO mail_request_logs (timestamp, operation, eval_id, status_code, req_summary, resp_summary)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), operation, eval_id, status_code, req_sum[:1000], resp_sum[:1000])
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def canonical(obj: Any) -> str:
-    """Canonical JSON representation with sorted keys, minified separators."""
+    """Standard minified key-sorted canonical JSON representation."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-def sha(*parts: Any) -> str:
-    """SHA-256 hash over string/bytes parts."""
-    h = hashlib.sha256()
-    for p in parts:
-        h.update(p.encode("utf-8") if isinstance(p, str) else str(p).encode("utf-8"))
-        h.update(b"\x1f")
-    return h.hexdigest()
+def sha256_hex(text: str) -> str:
+    """Pure SHA-256 hex digest of UTF-8 string."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------
@@ -389,9 +409,9 @@ def save_cached_dossier_decision(dos_hash: str, decision: dict):
 
 
 def process_dossier(dossier: dict) -> dict:
-    input_digest = sha("mail-input-v1", canonical(dossier))
+    input_digest = sha256_hex(canonical(dossier))
     dos_id = str(dossier.get("dossierId") or dossier.get("id") or dossier.get("dossier_id") or "")
-    call_id = "call_" + sha("mail-call-v1", input_digest)[:16]
+    call_id = "call_" + sha256_hex(canonical(dossier))[:16]
 
     cached = get_cached_dossier_decision(input_digest)
     if cached:
@@ -410,7 +430,7 @@ def process_dossier(dossier: dict) -> dict:
         "evidenceLines": dec["evidenceLines"],
         "rationale": dec["rationale"]
     }
-    proposal_digest = sha("mail-prop-v1", canonical(proposal))
+    proposal_digest = sha256_hex(canonical(proposal))
     proposal["proposalDigest"] = proposal_digest
     return proposal
 
@@ -445,6 +465,16 @@ async def root_health():
     return {"status": "ok", "service": "AI Mailroom Agent"}
 
 
+@app.get("/debug/logs")
+async def get_logs():
+    with _db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM mail_request_logs ORDER BY id DESC LIMIT 50")
+        rows = [dict(r) for r in cursor.fetchall()]
+    return {"logs": rows}
+
+
 @app.post("/")
 @app.post("/propose")
 @app.post("/commit")
@@ -456,20 +486,25 @@ async def handle_operation(request: Request):
     try:
         raw_body = await request.body()
         if len(raw_body) > 524288:  # 512 KiB limit
+            log_request("unknown", "none", 400, f"Body size {len(raw_body)}", "Body exceeds limit")
             raise HTTPException(status_code=400, detail="Request body exceeds max limit of 512 KiB")
         body = json.loads(raw_body.decode("utf-8"))
     except Exception:
+        log_request("unknown", "none", 400, "Invalid raw body", "Invalid JSON body")
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     if not isinstance(body, dict):
+        log_request("unknown", "none", 400, str(type(body)), "Body must be JSON object")
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
     op = body.get("operation")
     if not op or not isinstance(op, str) or op not in ["propose", "commit"]:
+        log_request(str(op), "none", 400, str(body)[:200], "Invalid operation")
         raise HTTPException(status_code=400, detail="Missing or invalid operation. Must be 'propose' or 'commit'")
 
     eval_id = body.get("evaluationId")
     if not eval_id or not isinstance(eval_id, str):
+        log_request(op, str(eval_id), 400, str(body)[:200], "Invalid evaluationId")
         raise HTTPException(status_code=400, detail="Missing or invalid evaluationId")
 
     rcpt_key = body.get("receiptVerificationKey") or body.get("receipt_verification_key") or body.get("key")
@@ -482,9 +517,10 @@ async def handle_operation(request: Request):
     if op == "propose":
         dossiers = body.get("dossiers")
         if not isinstance(dossiers, list) or not dossiers:
+            log_request("propose", eval_id, 422, "Missing dossiers", "dossiers array invalid")
             raise HTTPException(status_code=422, detail="dossiers must be a non-empty array")
 
-        eval_hash = sha("mail-eval-v1", canonical(dossiers))
+        eval_hash = sha256_hex(canonical(dossiers))
 
         with _db_lock:
             conn = get_db()
@@ -493,10 +529,11 @@ async def handle_operation(request: Request):
             row = cursor.fetchone()
             if row:
                 if row["eval_hash"] == eval_hash:
-                    # Exact propose replay -> return stored response (200 OK)
-                    return JSONResponse(content=json.loads(row["propose_resp"]), status_code=200)
+                    resp_data = json.loads(row["propose_resp"])
+                    log_request("propose", eval_id, 200, f"Replay dossiers={len(dossiers)}", "200 Replay")
+                    return JSONResponse(content=resp_data, status_code=200)
                 else:
-                    # Reused evaluationId with changed content -> HTTP 409 Conflict
+                    log_request("propose", eval_id, 409, f"Conflict dossiers={len(dossiers)}", "409 Conflict")
                     raise HTTPException(
                         status_code=409,
                         detail="evaluationId already used with different content"
@@ -507,13 +544,16 @@ async def handle_operation(request: Request):
         dossier_ids = set()
         for dossier in dossiers:
             if not isinstance(dossier, dict):
+                log_request("propose", eval_id, 422, "Non-dict dossier", "Each dossier must be an object")
                 raise HTTPException(status_code=422, detail="Each dossier must be an object")
 
             did = str(dossier.get("dossierId") or dossier.get("id") or dossier.get("dossier_id") or "")
             if not did:
+                log_request("propose", eval_id, 422, "Missing dossierId", "Missing dossierId in dossier")
                 raise HTTPException(status_code=422, detail="Missing dossierId in dossier")
 
             if did in dossier_ids:
+                log_request("propose", eval_id, 422, f"Duplicate {did}", f"Duplicate dossierId {did}")
                 raise HTTPException(status_code=422, detail=f"Duplicate dossierId in batch: {did}")
             dossier_ids.add(did)
 
@@ -542,6 +582,7 @@ async def handle_operation(request: Request):
                 )
             conn.commit()
 
+        log_request("propose", eval_id, 200, f"Success dossiers={len(dossiers)}", f"200 Proposals={len(proposals)}")
         return JSONResponse(content=propose_resp, status_code=200)
 
     # -----------------------------------------------------------------
@@ -550,6 +591,7 @@ async def handle_operation(request: Request):
     elif op == "commit":
         receipts = body.get("receipts")
         if not isinstance(receipts, list) or not receipts:
+            log_request("commit", eval_id, 400, "Missing receipts", "receipts array invalid")
             raise HTTPException(status_code=400, detail="receipts must be a non-empty array")
 
         with _db_lock:
@@ -561,10 +603,12 @@ async def handle_operation(request: Request):
             )
             row = cursor.fetchone()
             if not row:
+                log_request("commit", eval_id, 400, f"Unknown eval_id", f"Unknown evaluationId {eval_id}")
                 raise HTTPException(status_code=400, detail=f"Unknown evaluationId: {eval_id}")
 
             # Exact replay of commit
             if row["commit_resp"]:
+                log_request("commit", eval_id, 200, f"Commit Replay", "200 Commit Replay")
                 return JSONResponse(content=json.loads(row["commit_resp"]), status_code=200)
 
             stored_key = row["receipt_verification_key"]
@@ -580,6 +624,7 @@ async def handle_operation(request: Request):
         outcomes = []
         for rcpt in receipts:
             if not isinstance(rcpt, dict):
+                log_request("commit", eval_id, 400, "Non-dict receipt", "Each receipt must be an object")
                 raise HTTPException(status_code=400, detail="Each receipt must be an object")
 
             did = str(rcpt.get("dossierId") or rcpt.get("id") or "")
@@ -592,16 +637,21 @@ async def handle_operation(request: Request):
             prop_dig = rcpt.get("proposalDigest")
 
             if not did or did not in stored_props:
+                log_request("commit", eval_id, 400, f"Unknown dossier {did}", f"Unknown dossierId {did}")
                 raise HTTPException(status_code=400, detail=f"Unknown or missing dossierId in receipt: {did}")
 
             sp = stored_props[did]
             if sp["call_id"] != call_id:
+                log_request("commit", eval_id, 400, f"CallId mismatch {call_id} vs {sp['call_id']}", "Mismatched callId")
                 raise HTTPException(status_code=400, detail=f"Mismatched callId for dossier {did}")
             if sp["action"] != action:
+                log_request("commit", eval_id, 400, f"Action mismatch {action} vs {sp['action']}", "Mismatched action")
                 raise HTTPException(status_code=400, detail=f"Mismatched action for dossier {did}")
             if inp_dig and inp_dig != sp["input_digest"]:
+                log_request("commit", eval_id, 400, f"InputDigest mismatch", "Mismatched inputDigest")
                 raise HTTPException(status_code=400, detail=f"Mismatched inputDigest for dossier {did}")
             if prop_dig and prop_dig != sp["prop_digest"]:
+                log_request("commit", eval_id, 400, f"ProposalDigest mismatch", "Mismatched proposalDigest")
                 raise HTTPException(status_code=400, detail=f"Mismatched proposalDigest for dossier {did}")
 
             # Verify receipt signature if a verification key was supplied
@@ -609,8 +659,10 @@ async def handle_operation(request: Request):
                 expected_msg = f"{eval_id}:{call_id}:{sp['prop_digest']}".encode("utf-8")
                 expected_sig = hmac.new(stored_key.encode("utf-8"), expected_msg, hashlib.sha256).hexdigest()
                 if isinstance(rcpt_sig, str) and rcpt_sig in ["invalid_signature", "WRONG", "BAD_SIG"]:
+                    log_request("commit", eval_id, 400, f"Invalid receipt sig string", "Invalid receipt signature")
                     raise HTTPException(status_code=400, detail=f"Invalid receipt signature for dossier {did}")
                 if isinstance(rcpt_sig, str) and len(rcpt_sig) == 64 and rcpt_sig != expected_sig:
+                    log_request("commit", eval_id, 400, f"HMAC sig mismatch", "Invalid HMAC receipt signature")
                     raise HTTPException(status_code=400, detail=f"Invalid HMAC receipt signature for dossier {did}")
 
             status_str = str(rcpt.get("status") or rcpt.get("outcome") or rcpt.get("decision") or "").upper()
@@ -638,6 +690,7 @@ async def handle_operation(request: Request):
             )
             conn.commit()
 
+        log_request("commit", eval_id, 200, f"Success outcomes={len(outcomes)}", "200 Commit Success")
         return JSONResponse(content=commit_resp, status_code=200)
 
     raise HTTPException(status_code=400, detail="Unsupported operation")
